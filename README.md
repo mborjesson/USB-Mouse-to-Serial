@@ -62,12 +62,17 @@ The following parameters are available:
 	If not set it will use /dev/ttyUSB0.
 -i, --input device
 	USB mouse device to use as input.
-	It is recommended to not set this and let the program find a mouse automatically. If a mouse can’t be found or if the computer has more than one mouse connected use this to manually select one. The device is one of /dev/input/event*.
+	It is recommended to not set this and let the program find a mouse automatically.
+	If a mouse can’t be found or if the computer has more than one mouse connected use
+	this to manually select one. The device is one of /dev/input/event*.
 -p, --protocol protocol
-	The protocol to use. One of microsoft, logitech, wheel or mousesystems (see Mouse Protocols above). The default is microsoft.
+	The protocol to use. One of microsoft, logitech, wheel or mousesystems (see
+	Mouse Protocols above). The default is microsoft.
 -r, --rate rate
 	The rate to write to the serial output device in milliseconds.
-	This value can be used to tweak how often the program should send data to the computer. By default the rate is 7.5 milliseconds for all protocols except Mouse Systems which is 8.33 milliseconds (might change later).
+	This value can be used to tweak how often the program should send data to the computer.
+	By default the rate is 7.5 milliseconds for all protocols except Mouse Systems which
+	is 8.33 milliseconds (might change later).
 -d, --daemon
 	Run in background.
 -s, --suspend
