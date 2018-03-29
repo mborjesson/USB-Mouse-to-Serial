@@ -37,6 +37,14 @@
 #include <getopt.h>
 #include <locale.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+#define VERSION "1.1"
+#define VERSION_API 1
 
 /* Protocol reset timeout in milliseconds. Set to 0 to disable. */
 #define PROTOCOL_RESET_TIMEOUT 1000
@@ -54,8 +62,13 @@
 #define PROTOCOL_LOGITECH (1<<2|THREE_BUTTONS|SERIAL_7N1)
 #define PROTOCOL_MOUSE_SYSTEMS (1<<3|THREE_BUTTONS|SERIAL_8N1)
 
+#define SOCKET_RECV_SIZE 512
+#define SOCKET_BUF_SIZE 64
+#define SOCKET_SEND_SIZE 8196
+
 static volatile int running = 0;
 static volatile int input_running = 0;
+static volatile int socket_running = 0;
 static volatile int mouse_suspend = 0;
 
 static pthread_mutex_t input_mutex;
@@ -84,6 +97,14 @@ static float x_multiplier = 1.0;
 static float y_multiplier = 1.0;
 static int enable_multiplier = 0;
 
+static float x_multiplier_remote = 1.0;
+static float y_multiplier_remote = 1.0;
+static int enable_x_multiplier_remote = 0;
+static int enable_y_multiplier_remote = 0;
+static int mouse_swap_remote = 0;
+static int enable_mouse_swap_remote = 0;
+static int requested_output_rate_remote = 0; /* In nanoseconds */
+
 static int mouse_swap = 0;
 
 static struct termios original_termios_options;
@@ -91,7 +112,6 @@ static struct termios original_termios_options;
 static int verbose_level = 0;
 
 static int requested_output_rate = 0; /* In nanoseconds */
-static int output_rate = 0; /* In nanoseconds */
 static int mouse_auto_suspend = 0;
 static char original_suspend_mode[32];
 
@@ -106,10 +126,15 @@ static void verbose(int level, const char *format, ...) {
 	}
 }
 
-static void inthandler(int d) {
+static void shutdown_now() {
 	printf("Shutting down...\n");
 	running = 0;
 	input_running = 0;
+	socket_running = 0;
+}
+
+static void inthandler(int d) {
+	shutdown_now();
 }
 
 static int write_char(int fd, char c) {
@@ -180,12 +205,20 @@ static int protocol_has_feature(int protocol, int state) {
 	return (protocol&state) == state;
 }
 
-static void set_default_output_rate(int protocol) {
+static int get_default_output_rate(int protocol) {
 	if (protocol_has_feature(protocol, SERIAL_8N1)) {
-		output_rate = 8333333; /* (1 start bit + 8 data bits + 1 stop bits) / 1200 baud */
-	} else {
-		output_rate = 7500000; /* (1 start bit + 7 data bits + 1 stop bits) / 1200 baud */
+		return 8333333; /* (1 start bit + 8 data bits + 1 stop bits) / 1200 baud */
 	}
+	return 7500000; /* (1 start bit + 7 data bits + 1 stop bits) / 1200 baud */
+}
+
+static int get_output_rate(int protocol) {
+	if (requested_output_rate_remote > 0) {
+		return requested_output_rate_remote;
+	} else if (requested_output_rate > 0) {
+		return requested_output_rate;
+	}
+	return get_default_output_rate(protocol);
 }
 
 static const char* get_protocol_name(int protocol) {
@@ -227,6 +260,321 @@ static int pop_button_queue(struct mouse_button_queue_t* queue, struct mouse_but
 		}
 		queue->size--;
 		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Live Configuration API
+ *
+ * These functions sets up a tiny web server
+ */
+
+static int receive_request(const int fd, char* dst, const size_t size)
+{
+	int r;
+	char buf[SOCKET_BUF_SIZE];
+	size_t buffer_pos, sz;
+
+	buffer_pos = sz = 0;
+
+	struct timeval tv;
+	tv.tv_sec = 5; /* 5 second timeout */
+	tv.tv_usec = 0;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+	while (1) {
+		r = recv(fd, buf, SOCKET_BUF_SIZE, 0);
+		if (r <= 0) {
+			return buffer_pos;
+		}
+		if (buffer_pos < size) {
+			sz = buffer_pos+r > size ? size-(buffer_pos+r) : r;
+			memcpy(dst+buffer_pos, buf, sz);
+			buffer_pos += sz;
+		}
+		/* Check if buffer ends with \r\n\r\n, if it does it's done */
+		if (buffer_pos >= 4 &&
+			dst[buffer_pos-4] == '\r' && dst[buffer_pos-3] == '\n' &&
+			dst[buffer_pos-2] == '\r' && dst[buffer_pos-1] == '\n') {
+			return buffer_pos;
+		}
+	}
+	return 0;
+}
+
+static int terminate_line(char* buffer, const size_t size) {
+	int i;
+	for (i = 0; i < size; ++i) {
+		if (buffer[i] == '\r' || buffer[i] == '\n') {
+			buffer[i] = 0;
+			return i;
+		}
+	}
+	buffer[size-1] = 0;
+	return size;
+}
+
+static int is_get(const char* str) {
+	if (strlen(str) >= 4) {
+		if (!strncmp(str, "GET ", 4)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int get_path(const char* src, char* dst, const size_t dst_size) {
+	char* path_start = strchr(src, ' ');
+	if (path_start) {
+		char* path_end = strchr(path_start + 1, ' ');
+		if (!path_end) {
+			path_end = (char*)src+strlen(src)-1;
+		}
+		size_t size = path_end - path_start;
+		if (size <= dst_size) {
+			memcpy(dst, path_start + 1, size);
+			return size-1;
+		}
+	}
+	return 0;
+}
+
+static int get_query_value(const char* buffer, const char* key, const size_t key_size, char* dst, const size_t dst_size) {
+	int i, j;
+	size_t buf_size, sz;
+	char* query_start;
+	char* value_end;
+	query_start = strchr(buffer, '?');
+	if (query_start) {
+		buf_size = (buffer+strlen(buffer))-query_start+1;
+		for (i = 1; i < buf_size; ++i) {
+			if (!strncmp(buffer+i, key, key_size)) {
+				if ((buffer[i-1] == '?' || buffer[i-1] == '&') &&
+					(i+key_size == buf_size || (i+key_size < buf_size && (buffer[i+key_size] == '=' || buffer[i+key_size] == '&')))) {
+					j = i;
+					if (i+key_size < buf_size && (buffer[i+key_size] == '=' || buffer[i+key_size] == '&')) {
+						j++;
+					}
+					value_end = strchr(buffer+j+key_size, '&');
+					if (!value_end) {
+						value_end = query_start+buf_size-1;
+					}
+					sz = value_end-(buffer+j+key_size);
+					sz = sz < dst_size ? sz : dst_size;
+					memcpy(dst, buffer+j+key_size, sz);
+					return sz;
+				}
+			}
+		}
+	}
+
+	return -1;
+}
+
+static int close_socket(int sock) {
+	int r;
+	shutdown(sock, 2);
+
+	r = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &r, sizeof(int));
+}
+
+static int open_socket(const int port) {
+	int sock;
+	int r;
+	struct sockaddr_in addr;
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		perror("Can't open socket");
+		return -1;
+	}
+
+	r = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &r, sizeof(int));
+
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port = htons(port);
+
+	if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+		close(sock);
+		perror("Can't bind socket");
+		return -1;
+	}
+
+	listen(sock, 10);
+
+	return sock;
+}
+
+static void* socket_loop(void* ptr) {
+	int fd;
+	int sock;
+	int r, rq;
+	struct sockaddr_in addr;
+
+	char buffer[SOCKET_RECV_SIZE];
+	char path[SOCKET_BUF_SIZE];
+	char value[SOCKET_BUF_SIZE];
+
+	char response_data[SOCKET_SEND_SIZE];
+
+	char ip[INET_ADDRSTRLEN];
+
+	const char response_header[] = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n";
+
+	socklen_t addr_len = sizeof(addr);
+
+	sock = *(int*)ptr;
+
+	while (socket_running) {
+		verbose(2, "Waiting for connection...\n");
+		fd = accept(sock, (struct sockaddr*)&addr, &addr_len);
+		if (!socket_running) {
+			verbose(2, "Socket closed.\n");
+			if (fd != -1) {
+				close(fd);
+			}
+			break;
+		}
+		inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
+		verbose(2, "Connection accepted from %s.\n", ip);
+		if (fd == -1) {
+			perror("Can't accept socket");
+			continue;
+		}
+
+		r = receive_request(fd, buffer, SOCKET_RECV_SIZE-1);
+		r = terminate_line(buffer, r);
+		if (is_get(buffer)) {
+			r = get_path(buffer, path, SOCKET_BUF_SIZE-1);
+			path[r] = 0;
+
+			pthread_mutex_lock(&input_mutex);
+			if (!mouse_suspend) {
+				if ((rq = get_query_value(path, "x", 1, value, SOCKET_BUF_SIZE-1)) > 0) {
+					value[rq] = 0;
+					x_multiplier_remote = atof(value);
+					enable_x_multiplier_remote = 1;
+					verbose(1, "Remote X multiplier: %f\n", x_multiplier_remote);
+				}
+				if ((rq = get_query_value(path, "y", 1, value, SOCKET_BUF_SIZE-1)) > 0) {
+					value[rq] = 0;
+					y_multiplier_remote = atof(value);
+					enable_y_multiplier_remote = 1;
+					verbose(1, "Remote Y multiplier: %f\n", y_multiplier_remote);
+				}
+				if ((rq = get_query_value(path, "swap", 4, value, SOCKET_BUF_SIZE-1)) > 0) {
+					value[rq] = 0;
+					mouse_swap_remote = !strcasecmp(value, "true") || atoi(value);
+					enable_mouse_swap_remote = 1;
+					verbose(1, "Remote mouse button swap: %d\n", enable_mouse_swap_remote);
+				}
+				if ((rq = get_query_value(path, "invert", 6, value, SOCKET_BUF_SIZE-1)) > 0) {
+					value[rq] = 0;
+					rq = !strcasecmp(value, "true") || atoi(value);
+					if (enable_y_multiplier_remote) {
+						if ((rq && y_multiplier_remote > 0) || (!rq && y_multiplier_remote < 0)) {
+							y_multiplier_remote = -y_multiplier_remote;
+							enable_y_multiplier_remote = 1;
+						}
+					} else if ((rq && y_multiplier > 0) || (!rq && y_multiplier < 0)) {
+						y_multiplier_remote = -y_multiplier;
+						enable_y_multiplier_remote = 1;
+					}
+					verbose(1, "Remote mouse invert: %d\n", rq);
+				}
+				if ((rq = get_query_value(path, "rate", 4, value, SOCKET_BUF_SIZE-1)) > 0) {
+					value[rq] = 0;
+					requested_output_rate_remote = atof(value)*1000.0*1000.0;
+					verbose(1, "Remote output rate: %f\n", get_output_rate(mouse_protocol)/(1000.0*1000.0));
+				}
+			}
+			if ((rq = get_query_value(path, "reset", 5, value, SOCKET_BUF_SIZE-1)) >= 0) {
+				value[rq] = 0;
+				if (rq == 0 || !strcasecmp(value, "true") || atoi(value)) {
+					verbose(1, "Remote reset.\n");
+					x_multiplier_remote = y_multiplier_remote = 1.0;
+					enable_x_multiplier_remote = enable_y_multiplier_remote = 0;
+					mouse_swap_remote = mouse_swap;
+					enable_mouse_swap_remote = 0;
+					requested_output_rate_remote = 0;
+				}
+			}
+			/*
+			if ((rq = get_query_value(path, "exit", 4, value, SOCKET_BUF_SIZE)) >= 0) {
+				value[rq] = 0;
+				if (rq == 0 || !strcasecmp(value, "true") || atoi(value)) {
+					printf("Remote exit.\n");
+					shutdown_now();
+				}
+			}
+			*/
+
+			strcpy(response_data, "{");
+
+			strcat(response_data, "\"power\":");
+			strcat(response_data, !mouse_suspend ? "true" : "false");
+
+			strcat(response_data, ",\"version\":{");
+
+			strcat(response_data, "\"program\":\"");
+			strcat(response_data, VERSION);
+
+			strcat(response_data, "\",");
+
+			strcat(response_data, "\"api\":");
+			snprintf(value, SOCKET_BUF_SIZE-1, "%d", VERSION_API);
+			strcat(response_data, value);
+
+			strcat(response_data, "}");
+
+			if (!mouse_suspend) {
+				strcat(response_data, ",\"settings\":{");
+
+				strcat(response_data, "\"x\":");
+				snprintf(value, SOCKET_BUF_SIZE-1, "%f", enable_x_multiplier_remote ? x_multiplier_remote : x_multiplier);
+				strcat(response_data, value);
+
+				strcat(response_data, ",");
+
+				strcat(response_data, "\"y\":");
+				snprintf(value, SOCKET_BUF_SIZE-1, "%f", enable_y_multiplier_remote ? y_multiplier_remote : y_multiplier);
+				strcat(response_data, value);
+
+				strcat(response_data, ",");
+
+				strcat(response_data, "\"swap\":");
+				strcat(response_data, (enable_mouse_swap_remote ? mouse_swap_remote : mouse_swap) ? "true" : "false");
+
+				strcat(response_data, ",");
+
+				strcat(response_data, "\"rate\":");
+				snprintf(value, SOCKET_BUF_SIZE-1, "%f", get_output_rate(mouse_protocol)/(1000.0*1000.0));
+				strcat(response_data, value);
+
+				strcat(response_data, "},\"info\":{");
+
+				strcat(response_data, "\"protocol\":\"");
+				strcat(response_data, get_protocol_name(mouse_protocol));
+
+				strcat(response_data, "\"");
+
+				strcat(response_data, "}");
+			}
+
+			strcat(response_data, "}");
+
+			pthread_mutex_unlock(&input_mutex);
+		}
+		verbose(2, "Send response.\n");
+
+		r = send(fd, response_header, sizeof(response_header)-1, MSG_NOSIGNAL);
+		r = send(fd, response_data, strlen(response_data), MSG_NOSIGNAL);
+		verbose(2, "Close connection.\n");
+		close(fd);
 	}
 	return 0;
 }
@@ -375,6 +723,7 @@ static void* input_loop(void* ptr) {
 	struct timespec ts;
 	struct libevdev* dev;
 	int rc, grab, r;
+	int swap;
 
 	int power_control_fd;
 	int mouse_suspended;
@@ -495,11 +844,12 @@ static void* input_loop(void* ptr) {
 						mouse_wheel += wheel;
 
 						/* update mouse buttons */
+						swap = enable_mouse_swap_remote ? mouse_swap_remote : mouse_swap;
 						if (old_right != right) {
-							push_button_queue(mouse_swap ? &mouse_left : &mouse_right, right);
+							push_button_queue(swap ? &mouse_left : &mouse_right, right);
 						}
 						if (old_left != left) {
-							push_button_queue(mouse_swap ? &mouse_right : &mouse_left, left);
+							push_button_queue(swap ? &mouse_right : &mouse_left, left);
 						}
 						if (old_middle != middle) {
 							push_button_queue(&mouse_middle, middle);
@@ -607,6 +957,11 @@ static void* output_loop(void* ptr) {
 	int test_mode;
 	int test_speed;
 	struct mouse_button_t test_left, test_right, test_middle;
+	int test_output_rate;
+
+	float xm, ym;
+	int enable_multip;
+	int output_rate;
 
 	serial_fd = *(int*)ptr;
 
@@ -625,6 +980,7 @@ static void* output_loop(void* ptr) {
 	memset(&middle, 0, sizeof(struct mouse_button_t));
 	memset(&right, 0, sizeof(struct mouse_button_t));
 
+	output_rate = test_output_rate = get_output_rate(mouse_protocol);
 	ts_block.tv_sec = 0;
 	ts_block.tv_nsec = output_rate;
 
@@ -670,6 +1026,12 @@ static void* output_loop(void* ptr) {
 			} else if (left.down) {
 				next_protocol = PROTOCOL_MOUSE_SYSTEMS;
 			} else if (!mouse_suspend && mouse_suspended && PROTOCOL_RESET_TIMEOUT > 0 && clock_elapsed(&ts_suspended) >= PROTOCOL_RESET_TIMEOUT) {
+				pthread_mutex_lock(&input_mutex);
+				x_multiplier_remote = y_multiplier_remote = 1.0;
+				enable_x_multiplier_remote = enable_y_multiplier_remote = 0;
+				enable_mouse_swap_remote = 0;
+				requested_output_rate_remote = 0;
+				pthread_mutex_unlock(&input_mutex);
 				next_protocol = requested_protocol;
 			}
 			mouse_suspended = 0;
@@ -690,15 +1052,17 @@ static void* output_loop(void* ptr) {
 				mouse_protocol = next_protocol;
 				printf("Protocol changed to %s\n", get_protocol_name(mouse_protocol));
 			}
-			if (requested_output_rate > 0) {
-				output_rate = requested_output_rate;
-			} else {
-				set_default_output_rate(mouse_protocol);
-			}
-			ts_block.tv_sec = 0;
-			ts_block.tv_nsec = output_rate;
 
 			initialize_request = 0;
+		}
+
+		/* Set default values */
+		enable_multip = 0;
+		xm = ym = 1.0;
+		if (enable_multiplier) {
+			enable_multip = 1;
+			xm = x_multiplier;
+			ym = y_multiplier;
 		}
 
 		/* Get the latest state of the mouse */
@@ -724,6 +1088,17 @@ static void* output_loop(void* ptr) {
 		if (pop_button_queue(&mouse_right, &right)) {
 			update = 1;
 		}
+		if (enable_x_multiplier_remote) {
+			enable_multip = 1;
+			xm = x_multiplier_remote;
+		}
+		if (enable_y_multiplier_remote) {
+			enable_multip = 1;
+			ym = y_multiplier_remote;
+		}
+		output_rate = get_output_rate(mouse_protocol);
+		ts_block.tv_sec = 0;
+		ts_block.tv_nsec = output_rate;
 		pthread_mutex_unlock(&input_mutex);
 
 		if (x != 0 || y != 0 || (protocol_has_feature(mouse_protocol, MOUSE_WHEEL) && wheel != 0)) {
@@ -744,8 +1119,8 @@ static void* output_loop(void* ptr) {
 					}
 					printf("Test speed: %d\n", test_speed);
 				} else {
-					output_rate += pow(10, 5)*wheel;
-					printf("Output rate: %f\n", output_rate/(1000.0*1000.0));
+					test_output_rate += pow(10, 5)*wheel;
+					printf("Output rate: %f\n", test_output_rate/(1000.0*1000.0));
 				}
 			}
 
@@ -771,6 +1146,7 @@ static void* output_loop(void* ptr) {
 			}
 
 			test_left.changed = test_middle.changed = test_right.changed = 0;
+			output_rate = test_output_rate;
 
 			update = test_mode > 0;
 		}
@@ -779,9 +1155,9 @@ static void* output_loop(void* ptr) {
 			if (verbose_level >= 1) {
 				num_updates++;
 			}
-			if (enable_multiplier) {
-				x = x < 0 ? floor(x*x_multiplier) : ceil(x*x_multiplier);
-				y = y < 0 ? floor(y*y_multiplier) : ceil(y*y_multiplier);
+			if (enable_multip) {
+				x = x < 0 ? floor(x*xm) : ceil(x*xm);
+				y = y < 0 ? floor(y*ym) : ceil(y*ym);
 			}
 
 			x = clamp(x, -127, 127);
@@ -823,9 +1199,9 @@ static void* output_loop(void* ptr) {
 					y = 0;
 				}
 
-				if (enable_multiplier) {
-					x = x < 0 ? floor(x*x_multiplier) : ceil(x*x_multiplier);
-					y = y < 0 ? floor(y*y_multiplier) : ceil(y*y_multiplier);
+				if (enable_multip) {
+					x = x < 0 ? floor(x*xm) : ceil(x*xm);
+					y = y < 0 ? floor(y*ym) : ceil(y*ym);
 				}
 
 				x = clamp(x, -127, 127);
@@ -892,6 +1268,10 @@ static void* output_loop(void* ptr) {
 		nanosleep(&ts_end, NULL);
 	}
 
+	if (output_test) {
+		printf("Output rate: %f\n", (test_output_rate/(1000.0*1000.0)));
+	}
+
 	return 0;
 }
 
@@ -903,8 +1283,11 @@ int main(int argc, char** argv) {
 	char input_device[256], output_device[256], protocol[256];
 	pthread_t input_thread;
 	pthread_t output_thread;
+	pthread_t socket_thread;
 	int background;
-	int serial_fd;
+	int serial_fd, sock;
+	int port;
+	int invert;
 
 	double rate;
 	int c, err, help;
@@ -916,11 +1299,13 @@ int main(int argc, char** argv) {
 		{ "suspend", no_argument, 0, 's' },
 		{ "test", no_argument, 0, 't' },
 		{ "swap", no_argument, 0, 'S' },
+		{ "invert", no_argument, 0, 'I' },
 
 		{ "input", required_argument, 0, 'i' },
 		{ "output", required_argument, 0, 'o' },
 		{ "rate", required_argument, 0, 'r' },
 		{ "protocol", required_argument, 0, 'p' },
+		{ "port", required_argument, 0, 'P' },
 		{ 0, 0, 0, 0 }
 	};
 
@@ -933,11 +1318,13 @@ int main(int argc, char** argv) {
 	rate = -1;
 	help = 0;
 	err = 0;
+	port = 0;
+	invert = 0;
 
-	while ((c = getopt_long(argc, argv, "VhvdstSi:o:r:p:x:y:", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "VhvdstSIi:o:r:p:P:x:y:", long_options, NULL)) != EOF) {
 		switch (c) {
 		case 'V':
-			printf("USB Mouse to Serial 1.0\n");
+			printf("USB Mouse to Serial %s\n", VERSION);
 			return EXIT_SUCCESS;
 
 		case 'v':
@@ -964,6 +1351,10 @@ int main(int argc, char** argv) {
 			mouse_swap = 1;
 			break;
 
+		case 'I':
+			invert = 1;
+			break;
+
 		case 'i':
 			snprintf(input_device, sizeof(input_device)-1, "%s", optarg);
 			break;
@@ -978,6 +1369,10 @@ int main(int argc, char** argv) {
 
 		case 'p':
 			snprintf(protocol, sizeof(protocol)-1, "%s", optarg);
+			break;
+
+		case 'P':
+			port = atoi(optarg);
 			break;
 
 		case 'x':
@@ -1022,6 +1417,10 @@ int main(int argc, char** argv) {
 			"      Multiply Y with this value\n"
 			"  -S, --swap\n"
 			"      Swap left and right mouse buttons\n"
+			"  -I, --invert\n"
+			"      The same as -y -1.0\n"
+			"  -P, --port port\n"
+			"      Start the Live Configuration API on this port\n"
 			"  -v, --verbose\n"
 			"      Increase verbosity, can be used multiple times\n"
 //			"  -t, --test\n"
@@ -1032,6 +1431,15 @@ int main(int argc, char** argv) {
 			"      Show usage and help\n"
 			);
 		return EXIT_FAILURE;
+	}
+
+	sock = 0;
+	if (port > 0) {
+		sock = open_socket(port);
+		if (sock == -1) {
+			return EXIT_FAILURE;
+		}
+		printf("Live Configuration API started on port: %d\n", port);
 	}
 
 	requested_protocol = PROTOCOL_MICROSOFT;
@@ -1047,6 +1455,11 @@ int main(int argc, char** argv) {
 	mouse_protocol = requested_protocol;
 	printf("Protocol: %s\n", get_protocol_name(mouse_protocol));
 
+	if (invert && y_multiplier > 0) {
+		y_multiplier = -y_multiplier;
+		enable_multiplier = 1;
+	}
+
 	if (enable_multiplier) {
 		printf("X/Y multiplier: %.1f, %.1f\n", x_multiplier, y_multiplier);
 	}
@@ -1059,11 +1472,9 @@ int main(int argc, char** argv) {
 	requested_output_rate = clamp(requested_output_rate, 0, 100*1000*1000);
 
 	if (requested_output_rate > 0) {
-		output_rate = requested_output_rate;
 		printf("Requested output rate: %.1f ms\n", requested_output_rate/(1000.0*1000.0));
 	} else {
 		printf("Default output rate.\n");
-		set_default_output_rate(mouse_protocol);
 	}
 	if (mouse_swap) {
 		printf("Left and right mouse buttons swapped.\n");
@@ -1105,6 +1516,11 @@ int main(int argc, char** argv) {
 	pthread_create(&input_thread, NULL, input_loop, input_device);
 	pthread_create(&output_thread, NULL, output_loop, &serial_fd);
 
+	if (port > 0) {
+		socket_running = 1;
+		pthread_create(&socket_thread, NULL, socket_loop, &sock);
+	}
+
 	pthread_join(output_thread, NULL);
 	running = 0;
 	input_running = 0;
@@ -1114,8 +1530,9 @@ int main(int argc, char** argv) {
 	tcsetattr(serial_fd, TCSANOW, &original_termios_options);
 	close(serial_fd);
 	
-	if (output_test) {
-		printf("Output rate: %f\n", (output_rate/(1000.0*1000.0)));
+	if (port > 0) {
+		close_socket(sock);
+		pthread_join(socket_thread, NULL);
 	}
 
 	return EXIT_SUCCESS;
