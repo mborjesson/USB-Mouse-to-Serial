@@ -43,8 +43,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-#define VERSION "1.1"
-#define VERSION_API 1
+#define VERSION "1.1.1"
 
 /* Protocol reset timeout in milliseconds. Set to 0 to disable. */
 #define PROTOCOL_RESET_TIMEOUT 1000
@@ -219,6 +218,19 @@ static int get_output_rate(int protocol) {
 		return requested_output_rate;
 	}
 	return get_default_output_rate(protocol);
+}
+
+static const char* get_protocol_id(int protocol) {
+	if (protocol == PROTOCOL_LOGITECH) {
+		return "logitech";
+	} else if (protocol == PROTOCOL_MICROSOFT_WHEEL) {
+		return "wheel";
+	} else if (protocol == PROTOCOL_MICROSOFT) {
+		return "microsoft";
+	} else if (protocol == PROTOCOL_MOUSE_SYSTEMS) {
+		return "mousesystems";
+	}
+	return "unknown";
 }
 
 static const char* get_protocol_name(int protocol) {
@@ -518,18 +530,9 @@ static void* socket_loop(void* ptr) {
 			strcat(response_data, "\"power\":");
 			strcat(response_data, !mouse_suspend ? "true" : "false");
 
-			strcat(response_data, ",\"version\":{");
-
-			strcat(response_data, "\"program\":\"");
+			strcat(response_data, ",\"version\":\"");
 			strcat(response_data, VERSION);
-
-			strcat(response_data, "\",");
-
-			strcat(response_data, "\"api\":");
-			snprintf(value, SOCKET_BUF_SIZE-1, "%d", VERSION_API);
-			strcat(response_data, value);
-
-			strcat(response_data, "}");
+			strcat(response_data, "\"");
 
 			if (!mouse_suspend) {
 				strcat(response_data, ",\"settings\":{");
@@ -558,7 +561,7 @@ static void* socket_loop(void* ptr) {
 				strcat(response_data, "},\"info\":{");
 
 				strcat(response_data, "\"protocol\":\"");
-				strcat(response_data, get_protocol_name(mouse_protocol));
+				strcat(response_data, get_protocol_id(mouse_protocol));
 
 				strcat(response_data, "\"");
 
@@ -1286,7 +1289,7 @@ int main(int argc, char** argv) {
 	pthread_t socket_thread;
 	int background;
 	int serial_fd, sock;
-	int port;
+	int config, port;
 	int invert;
 
 	double rate;
@@ -1300,6 +1303,7 @@ int main(int argc, char** argv) {
 		{ "test", no_argument, 0, 't' },
 		{ "swap", no_argument, 0, 'S' },
 		{ "invert", no_argument, 0, 'I' },
+		{ "config", no_argument, 0, 'c' },
 
 		{ "input", required_argument, 0, 'i' },
 		{ "output", required_argument, 0, 'o' },
@@ -1318,10 +1322,11 @@ int main(int argc, char** argv) {
 	rate = -1;
 	help = 0;
 	err = 0;
+	config = 0;
 	port = 0;
 	invert = 0;
 
-	while ((c = getopt_long(argc, argv, "VhvdstSIi:o:r:p:P:x:y:", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "VhvdstSIci:o:r:p:P:x:y:", long_options, NULL)) != EOF) {
 		switch (c) {
 		case 'V':
 			printf("USB Mouse to Serial %s\n", VERSION);
@@ -1353,6 +1358,10 @@ int main(int argc, char** argv) {
 
 		case 'I':
 			invert = 1;
+			break;
+
+		case 'c':
+			config = 1;
 			break;
 
 		case 'i':
@@ -1419,8 +1428,10 @@ int main(int argc, char** argv) {
 			"      Swap left and right mouse buttons\n"
 			"  -I, --invert\n"
 			"      The same as -y -1.0\n"
+			"  -c, --config\n"
+			"      Start the Live Configuration API\n"
 			"  -P, --port port\n"
-			"      Start the Live Configuration API on this port\n"
+			"      Set the port for the Live Configuration API, default is 8627\n"
 			"  -v, --verbose\n"
 			"      Increase verbosity, can be used multiple times\n"
 //			"  -t, --test\n"
@@ -1434,7 +1445,10 @@ int main(int argc, char** argv) {
 	}
 
 	sock = 0;
-	if (port > 0) {
+	if (config) {
+		if (port <= 0) {
+			port = 8627;
+		}
 		sock = open_socket(port);
 		if (sock == -1) {
 			return EXIT_FAILURE;
@@ -1516,7 +1530,7 @@ int main(int argc, char** argv) {
 	pthread_create(&input_thread, NULL, input_loop, input_device);
 	pthread_create(&output_thread, NULL, output_loop, &serial_fd);
 
-	if (port > 0) {
+	if (config) {
 		socket_running = 1;
 		pthread_create(&socket_thread, NULL, socket_loop, &sock);
 	}
@@ -1530,7 +1544,7 @@ int main(int argc, char** argv) {
 	tcsetattr(serial_fd, TCSANOW, &original_termios_options);
 	close(serial_fd);
 	
-	if (port > 0) {
+	if (config) {
 		close_socket(sock);
 		pthread_join(socket_thread, NULL);
 	}
