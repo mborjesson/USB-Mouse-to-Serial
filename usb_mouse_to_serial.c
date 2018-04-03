@@ -114,6 +114,9 @@ static int requested_output_rate = 0; /* In nanoseconds */
 static int mouse_auto_suspend = 0;
 static char original_suspend_mode[32];
 
+static int mouse_connected = 0;
+static char mouse_name[512];
+
 static int output_test = 0;
 
 static void verbose(int level, const char *format, ...) {
@@ -558,15 +561,27 @@ static void* socket_loop(void* ptr) {
 				snprintf(value, SOCKET_BUF_SIZE-1, "%f", get_output_rate(mouse_protocol)/(1000.0*1000.0));
 				strcat(response_data, value);
 
-				strcat(response_data, "},\"info\":{");
-
-				strcat(response_data, "\"protocol\":\"");
-				strcat(response_data, get_protocol_id(mouse_protocol));
-
-				strcat(response_data, "\"");
-
 				strcat(response_data, "}");
 			}
+
+			strcat(response_data, ",\"info\":{");
+
+			strcat(response_data, "\"mouse\":");
+
+			if (mouse_connected) {
+				strcat(response_data, "\"");
+				strncat(response_data, mouse_name, sizeof(mouse_name)-1);
+				strcat(response_data, "\"");
+			} else {
+				strcat(response_data, "null");
+			}
+
+			if (!mouse_suspend) {
+				strcat(response_data, ",\"protocol\":\"");
+				strcat(response_data, get_protocol_id(mouse_protocol));
+				strcat(response_data, "\"");
+			}
+			strcat(response_data, "}");
 
 			strcat(response_data, "}");
 
@@ -740,6 +755,9 @@ static void* input_loop(void* ptr) {
 	}
 
 	while(running) {
+		pthread_mutex_lock(&input_mutex);
+		mouse_connected = 0;
+		pthread_mutex_unlock(&input_mutex);
 		if (device) {
 			input_fd = open_input(device);
 		} else {
@@ -759,6 +777,11 @@ static void* input_loop(void* ptr) {
 		printf("Found mouse: %s (vendor: %x, product: %x)\n", libevdev_get_name(dev), libevdev_get_id_vendor(dev), libevdev_get_id_product(dev));
 		grab = 1;
 		printf("Exclusive mouse access: %s\n", !ioctl(input_fd, EVIOCGRAB, &grab) ? "yes" : "no");
+
+		pthread_mutex_lock(&input_mutex);
+		mouse_connected = 1;
+		strncpy(mouse_name, libevdev_get_name(dev), sizeof(mouse_name)-1);
+		pthread_mutex_unlock(&input_mutex);
 
 		power_control_fd = -1;
 		mouse_suspended = 0;
@@ -815,6 +838,7 @@ static void* input_loop(void* ptr) {
 					}
 				}
 			} else if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+				verbose(3, "evdev success: %d, %d\n", ev.type, ev.value);
 				if (ev.type == EV_REL) {
 					if (ev.code == REL_X) {
 						x = ev.value;
@@ -838,6 +862,7 @@ static void* input_loop(void* ptr) {
 
 					/* has anything changed? */
 					if (old_right != right || old_middle != middle || old_left != left || x != 0 || y != 0 || wheel != 0) {
+						verbose(2, "Mouse updated, x: %d, y: %d, wheel: %d, left: %d, middle: %d, right: %d\n", x, y, wheel, left, middle, right);
 						pthread_mutex_lock(&input_mutex);
 						/* update mouse positions */
 						mouse_x += x;
@@ -1512,6 +1537,7 @@ int main(int argc, char** argv) {
 		background = mouse_auto_suspend = 0;
 	}
 
+	mouse_name[0] = 0;
 	running = 1;
 
 	signal(SIGINT, inthandler);
