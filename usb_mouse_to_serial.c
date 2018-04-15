@@ -280,7 +280,7 @@ static int pop_button_queue(struct mouse_button_queue_t* queue, struct mouse_but
 }
 
 /*
- * Live Configuration API
+ * Remote Configuration API
  *
  * These functions sets up a tiny web server
  */
@@ -1454,9 +1454,9 @@ int main(int argc, char** argv) {
 			"  -I, --invert\n"
 			"      The same as -y -1.0\n"
 			"  -c, --config\n"
-			"      Start the Live Configuration API\n"
+			"      Start the Remote Configuration API\n"
 			"  -P, --port port\n"
-			"      Set the port for the Live Configuration API, default is 8627\n"
+			"      Set the port for the Remote Configuration API, default is 8627\n"
 			"  -v, --verbose\n"
 			"      Increase verbosity, can be used multiple times\n"
 //			"  -t, --test\n"
@@ -1478,7 +1478,7 @@ int main(int argc, char** argv) {
 		if (sock == -1) {
 			return EXIT_FAILURE;
 		}
-		printf("Live Configuration API started on port: %d\n", port);
+		printf("Remote Configuration API started on port: %d\n", port);
 	}
 
 	requested_protocol = PROTOCOL_MICROSOFT;
