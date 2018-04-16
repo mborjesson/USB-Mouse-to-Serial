@@ -1452,7 +1452,7 @@ int main(int argc, char** argv) {
 			"  -S, --swap\n"
 			"      Swap left and right mouse buttons\n"
 			"  -I, --invert\n"
-			"      The same as -y -1.0\n"
+			"      Invert the value of Y-multiplier\n"
 			"  -c, --config\n"
 			"      Start the Remote Configuration API\n"
 			"  -P, --port port\n"
