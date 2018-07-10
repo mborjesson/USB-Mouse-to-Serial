@@ -43,7 +43,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-#define VERSION "1.1.1"
+#define VERSION "1.1.2"
 
 /* Protocol reset timeout in milliseconds. Set to 0 to disable. */
 #define PROTOCOL_RESET_TIMEOUT 1000
@@ -740,6 +740,7 @@ static void* input_loop(void* ptr) {
 	int old_left, old_middle, old_right;
 	struct timespec ts;
 	struct libevdev* dev;
+	fd_set read_fds;
 	int rc, grab, r;
 	int swap;
 
@@ -822,8 +823,20 @@ static void* input_loop(void* ptr) {
 				if (rc != -EAGAIN) {
 					fprintf(stderr, "Error: %d %s\n", -rc, strerror(-rc));
 					input_running = 0;
-				} else if (mouse_suspend) {
-					sleep_ms(1);
+				} else {
+					/* Use pselect as timeout when input is idle, this prevents 100% CPU usage */
+					FD_ZERO(&read_fds);
+					FD_SET(input_fd, &read_fds);
+					ts.tv_sec = 0;
+					if (mouse_suspend) {
+						ts.tv_nsec = 100000000l;
+					} else {
+						ts.tv_nsec = 1000000l;
+					}
+					rc = pselect(input_fd+1, &read_fds, NULL, NULL, &ts, NULL);
+					if (rc < 0) {
+						perror("pselect()");
+					}
 				}
 			} else if (rc == LIBEVDEV_READ_STATUS_SYNC) {
 				/* This code is untested */
