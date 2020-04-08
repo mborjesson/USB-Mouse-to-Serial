@@ -1,6 +1,10 @@
 # USB Mouse to Serial
 
-This Linux-program will make a computer act as an adapter for a USB mouse to serial port. It was developed for Raspberry Pi to be able to use a modern USB mouse on older computers that only has a serial port.
+This Linux-program will make a computer act as an adapter for a USB mouse to serial port. It was developed for Raspberry Pi in mind to be able to use a modern USB mouse on older computers that only has a serial port.
+
+Click [here](https://www.youtube.com/watch?v=vAz2g2S6Rmw) to see a demonstration of what the program can do.
+
+[![Demonstration video](https://img.youtube.com/vi/vAz2g2S6Rmw/0.jpg)](https://www.youtube.com/watch?v=vAz2g2S6Rmw)
 
 ## Features
 
