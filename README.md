@@ -15,7 +15,7 @@ Click [here](https://www.youtube.com/watch?v=vAz2g2S6Rmw) to see a demonstration
 ## Requirements
 
 * Raspberry Pi running Raspbian - tested on a RPi 2 Model B running 2017-11-29-raspbian-stretch-lite
-* Serial port - a simple USB to serial port adapter works well
+* Serial port - for example a USB to serial port adapter (there may be issues with certain adapters, see [issue #7](https://github.com/mborjesson/USB-Mouse-to-Serial/issues/7))
 * Null modem cable
 * libevdev
 
