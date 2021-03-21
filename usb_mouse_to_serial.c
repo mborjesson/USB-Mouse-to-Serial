@@ -119,6 +119,18 @@ static char mouse_name[512];
 
 static int output_test = 0;
 
+static int idle_command_delay = 300; /* In seconds */
+static char idle_command[512];
+static int has_idle_command = 0;
+
+typedef void (*timer_callback_t)(int state, void* arg);
+
+struct timer_data_t {
+	int delay;
+	timer_callback_t callback;
+	void* arg;
+} timer_data_t;
+
 static void verbose(int level, const char *format, ...) {
 	if (level <= verbose_level) {
 		va_list args;
@@ -277,6 +289,55 @@ static int pop_button_queue(struct mouse_button_queue_t* queue, struct mouse_but
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * Timer
+ */
+
+void* timer_func(void* ptr) {
+	int sleep_ms, elapsed_ms;
+	struct timespec start;
+
+	struct timer_data_t* data = (struct timer_data_t*) ptr;
+
+	struct timespec sec;
+	sec.tv_sec = data->delay;
+	sec.tv_nsec = 0;
+	sleep_ms = clock_tomilliseconds(&sec);
+
+	timer_callback_t callback = data->callback;
+	void* arg = data->arg;
+
+	free(data);
+
+	clock_now(&start);
+	while (mouse_suspend) {
+		sleep(1);
+		elapsed_ms = clock_elapsed(&start);
+		if (elapsed_ms >= sleep_ms) {
+			// done
+			if (callback) {
+				callback(1, arg);
+			}
+			return NULL;
+		}
+	}
+	// cancelled
+	if (callback) {
+		callback(0, arg);
+	}
+
+	return NULL;
+}
+
+void start_timer(int delay, timer_callback_t callback, void *arg) {
+	pthread_t thread;
+	struct timer_data_t* data = (struct timer_data_t*) malloc(sizeof(struct timer_data_t));
+	data->delay = delay;
+	data->callback = callback;
+	data->arg = arg;
+	pthread_create(&thread, NULL, timer_func, data);
 }
 
 /*
@@ -963,7 +1024,7 @@ static int open_serial(const char* dev) {
 
 	fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (fd == -1) {
-		char str[256];
+		char str[300];
 		snprintf(str, sizeof(str)-1, "Unable to open %s", dev);
 		perror(str);
 		return -1;
@@ -976,6 +1037,19 @@ static int open_serial(const char* dev) {
 	set_serial_options(fd, mouse_protocol);
 
 	return fd;
+}
+
+void idle_command_timer_callback(int state, void* arg) {
+	int rc;
+	if (state) {
+		verbose(1, "Executing \"%s\".\n", idle_command);
+		rc = system(idle_command);
+		if (rc == -1) {
+			perror("system()");
+		}
+	} else {
+		verbose(1, "Idle command was cancelled.\n");
+	}
 }
 
 static void* output_loop(void* ptr) {
@@ -1003,11 +1077,14 @@ static void* output_loop(void* ptr) {
 	float xm, ym;
 	int enable_multip;
 	int output_rate;
+	int run_idle_command;
 
 	serial_fd = *(int*)ptr;
 
 	initialize_request = 0;
 	initialize = 0;
+
+	run_idle_command = 0;
 
 	mouse_suspended = 0;
 	clock_now(&ts_suspended);
@@ -1043,6 +1120,10 @@ static void* output_loop(void* ptr) {
 
 		if (mouse_suspend && !mouse_suspended) {
 			clock_now(&ts_suspended);
+			if (run_idle_command && has_idle_command) {
+				verbose(1, "Starting a timer for idle command...\n");
+				start_timer(idle_command_delay, idle_command_timer_callback, NULL);
+			}
 			mouse_suspended = 1;
 		}
 
@@ -1094,6 +1175,8 @@ static void* output_loop(void* ptr) {
 				printf("Protocol changed to %s\n", get_protocol_name(mouse_protocol));
 			}
 
+			run_idle_command = 1; // it's safe to run the idle command now
+			
 			initialize_request = 0;
 		}
 
@@ -1348,6 +1431,10 @@ int main(int argc, char** argv) {
 		{ "rate", required_argument, 0, 'r' },
 		{ "protocol", required_argument, 0, 'p' },
 		{ "port", required_argument, 0, 'P' },
+
+		{ "idlecommand", required_argument, 0, '1' },
+		{ "idlecommanddelay", required_argument, 0, '2' },
+
 		{ 0, 0, 0, 0 }
 	};
 
@@ -1364,7 +1451,7 @@ int main(int argc, char** argv) {
 	port = 0;
 	invert = 0;
 
-	while ((c = getopt_long(argc, argv, "VhvdstSIci:o:r:p:P:x:y:", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "VhvdstSIci12:o:r:p:P:x:y:", long_options, NULL)) != EOF) {
 		switch (c) {
 		case 'V':
 			printf("USB Mouse to Serial %s\n", VERSION);
@@ -1432,6 +1519,15 @@ int main(int argc, char** argv) {
 			enable_multiplier = 1;
 			break;
 
+		case '1':
+			snprintf(idle_command, sizeof(idle_command)-1, "%s", optarg);
+			has_idle_command = 1;
+			break;
+
+		case '2':
+			idle_command_delay = atoi(optarg);
+			break;
+
 		case '?':
 		default:
 			err++;
@@ -1472,6 +1568,10 @@ int main(int argc, char** argv) {
 			"      Set the port for the Remote Configuration API, default is 8627\n"
 			"  -v, --verbose\n"
 			"      Increase verbosity, can be used multiple times\n"
+			"  --idlecommand\n"
+			"      A command to run after mouse becomes idle\n"
+			"  --idlecommanddelay\n"
+			"      When to run the idle command, default is after 300 seconds\n"
 //			"  -t, --test\n"
 //			"      Enable output test mode\n"
 			"  -V, --version\n"
@@ -1531,6 +1631,11 @@ int main(int argc, char** argv) {
 	if (mouse_swap) {
 		printf("Left and right mouse buttons swapped.\n");
 	}
+
+	if (has_idle_command) {
+		printf("Run idle command \"%s\" after %d seconds.\n", idle_command, idle_command_delay);
+	}
+
 	if (verbose_level > 0) {
 		printf("Verbose level: %d\n", verbose_level);
 	}
