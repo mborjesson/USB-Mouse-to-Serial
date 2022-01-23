@@ -186,6 +186,14 @@ The following parameters are available:
 usb_mouse_to_serial --output /dev/ttyUSB1 --protocol wheel --suspend --daemon --config
 ```
 
+## DOS Drivers
+
+Any mouse driver designed for the specified protocol should work.
+
+### CuteMouse
+
+CuteMouse is a modern DOS-based open source mouse driver that is compatible with this project. It can be downloaded from http://cutemouse.sourceforge.net/
+
 ## Disclaimer
 
 This project is provided as-is, comes with no warranty and is not liable for any loss or damage to your equipment while using this program.
